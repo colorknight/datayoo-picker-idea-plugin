@@ -1,0 +1,1 @@
+rootProject.name = "datayoo-picker-idea-plugin"

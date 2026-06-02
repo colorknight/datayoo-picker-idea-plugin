@@ -1,0 +1,36 @@
+<!-- Plugin Configuration File: https://plugins.jetbrains.com/docs/intellij/plugin-configuration-file.html -->
+<idea-plugin require-restart="false">
+    <!-- Unique identifier of the plugin. It should be FQN, cannot be changed between the plugin versions. -->
+    <id>org.datayoo.datayoo-picker-idea-plugin</id>
+
+    <!-- Public plugin name should be written in Title Case.
+         Guidelines: https://plugins.jetbrains.com/docs/marketplace/best-practices-for-listing.html#plugin-name -->
+    <name>数由 GUI</name>
+
+    <!-- A displayed Vendor name or Organization ID displayed on the Plugins Page. -->
+    <vendor>数由</vendor>
+
+    <!-- Description of the plugin displayed on the Plugin Page and IDE Plugin Manager.
+         Guidelines: https://plugins.jetbrains.com/docs/marketplace/best-practices-for-listing.html#plugin-description -->
+    <description><![CDATA[
+        扫描当前项目中的算子（@OpDefiner）与连接器（connector-plugin module），支持串行 Maven 打包与 Run 控制台日志。
+    ]]></description>
+
+    <!-- Product and plugin compatibility requirements.
+         Read more: https://plugins.jetbrains.com/docs/intellij/plugin-compatibility.html -->
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.execution</depends>
+    <depends>com.intellij.modules.json</depends>
+    <depends>org.intellij.plugins.markdown</depends>
+    <depends>org.jetbrains.idea.maven</depends>
+
+    <!-- Extensions defined by the plugin.
+         Read more: https://plugins.jetbrains.com/docs/intellij/plugin-extension-points.html -->
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="数由 GUI"
+                    anchor="right"
+                    icon="/icons/toolWindowIcon.png"
+                    factoryClass="org.datayoo.picker.DatayooPickerToolWindowFactory"/>
+    </extensions>
+
+</idea-plugin>
