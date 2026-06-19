@@ -98,6 +98,7 @@ import java.nio.charset.StandardCharsets
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.ConcurrentHashMap
@@ -1445,7 +1446,7 @@ class DatayooPickerToolWindowFactory : ToolWindowFactory, DumbAware {
 
         override fun processTerminated(event: ProcessEvent) {
           appendDebug("EXIT ${event.exitCode} $stepLine", PackLogTone.DEFAULT)
-          packCoordinator?.detachMavenHandler()
+          packCoordinator?.detachMavenHandler(handler)
           val userStopped = packCoordinator?.consumeStopRequested() == true
           refreshModuleVfsAfterStep()
           if (userStopped) {
@@ -1517,6 +1518,273 @@ class DatayooPickerToolWindowFactory : ToolWindowFactory, DumbAware {
     }
 
     runNext()
+  }
+
+  /**
+   * 按 pomDir 并行执行 Maven 打包（仅用于「按Module打包」模式）。
+   * 预置阶段串行先跑完，然后不同 pomDir 之间并行，每个 pomDir 内部串行。
+   */
+  private fun runMavenParallelByPomDir(
+    project: Project,
+    statusArea: JBTextArea,
+    preflightCommands: List<MavenRunnerParameters>,
+    pomDirChains: List<Pair<String, List<MavenRunnerParameters>>>,
+    totalSteps: Int,
+    title: String,
+    appendDebug: (String, PackLogTone) -> Unit,
+    onPackZipProduced: ((OssUploader.PackKind, java.io.File) -> Unit)? = null,
+    onAllSucceeded: (() -> Unit)? = null,
+    onStepFailed: ((MavenRunnerParameters, Int) -> Unit)? = null,
+    onPackSessionFinished: (() -> Unit)? = null
+  ) {
+    val chainCount = pomDirChains.size
+    val totalChainSteps = pomDirChains.sumOf { it.second.size }
+    if (preflightCommands.isEmpty() && totalChainSteps == 0) return
+
+    val packCoordinator = runCatching { project.getService(MavenPackCoordinator::class.java) }.getOrNull()
+    if (packCoordinator != null && !packCoordinator.tryBeginPack()) {
+      appendDebug(
+        "PACK 已拒绝：本工程已有打包任务在执行。请等待当前打包结束后再试。",
+        PackLogTone.DEFAULT
+      )
+      ApplicationManager.getApplication().invokeLater {
+        statusArea.text = "打包未开始：已有进行中的打包任务"
+      }
+      return
+    }
+    fun releasePackLock() {
+      packCoordinator?.endPack()
+      onPackSessionFinished?.invoke()
+    }
+
+    // ---- Build mvn command (same logic as runMavenSequential) ----
+    fun mvnExecutable(): String {
+      val osName = System.getProperty("os.name")?.lowercase().orEmpty()
+      val isWin = osName.contains("win")
+      val generalSettings = runCatching { MavenProjectsManager.getInstance(project).generalSettings }.getOrNull()
+      val mavenHome = runCatching { generalSettings?.mavenHome }.getOrNull()
+        ?.trim()?.takeIf { it.isNotBlank() }
+      if (!mavenHome.isNullOrBlank()) {
+        val bin = java.io.File(mavenHome, "bin")
+        val exe = if (isWin) java.io.File(bin, "mvn.cmd") else java.io.File(bin, "mvn")
+        if (exe.exists()) return exe.absolutePath
+      }
+      return if (isWin) "mvn.cmd" else "mvn"
+    }
+
+    fun buildMvnCommand(params: MavenRunnerParameters): GeneralCommandLine {
+      val goals = params.goals
+      val options = params.cmdOptions?.trim()?.takeIf { it.isNotBlank() }
+        ?.split(Regex("\\s+")).orEmpty()
+      val generalSettings = runCatching { MavenProjectsManager.getInstance(project).generalSettings }.getOrNull()
+      val userSettings = runCatching { generalSettings?.userSettingsFile }.getOrNull()
+        ?.trim()?.takeIf { it.isNotBlank() }
+      val localRepo = runCatching { generalSettings?.localRepository }.getOrNull()
+        ?.trim()?.takeIf { it.isNotBlank() }
+      fun projectJdkHome(project: Project): String? {
+        val sdk: Sdk? = runCatching { ProjectRootManager.getInstance(project).projectSdk }.getOrNull()
+        val home = sdk?.homePath?.trim().orEmpty()
+        return home.takeIf { it.isNotBlank() }
+      }
+      val jdkHome = projectJdkHome(project)
+      val osName = System.getProperty("os.name")?.lowercase().orEmpty()
+      val isWin = osName.contains("win")
+      val cmd = mutableListOf<String>()
+      cmd += mvnExecutable()
+      cmd += "-B"
+      cmd += "-f"
+      cmd += params.pomFileName
+      if (!userSettings.isNullOrBlank()) { cmd += "-s"; cmd += userSettings }
+      cmd += goals
+      if (!localRepo.isNullOrBlank()) { cmd += "-Dmaven.repo.local=$localRepo" }
+      cmd += options
+      val commandLine = GeneralCommandLine(cmd)
+        .withWorkDirectory(params.workingDirPath)
+        .withParentEnvironmentType(GeneralCommandLine.ParentEnvironmentType.CONSOLE)
+      if (isWin) { commandLine.withCharset(Charset.forName("GB18030")) }
+      if (!jdkHome.isNullOrBlank()) {
+        commandLine.withEnvironment("JAVA_HOME", jdkHome)
+        val binDir = java.io.File(jdkHome, "bin").absolutePath
+        val currentPath = System.getenv("PATH").orEmpty()
+        val sep = if (isWin) ";" else ":"
+        val newPath = if (currentPath.isBlank()) binDir else "$binDir$sep$currentPath"
+        commandLine.withEnvironment("PATH", newPath)
+      }
+      return commandLine
+    }
+
+    fun refreshModuleVfs(workingDirPath: String) {
+      runCatching {
+        val workDir = java.io.File(workingDirPath)
+        val targetDir = java.io.File(workDir, "target")
+        if (targetDir.isDirectory) {
+          LocalFileSystem.getInstance().refreshAndFindFileByIoFile(targetDir)?.let { vf ->
+            if (vf.isValid) vf.refresh(true, true)
+          }
+        }
+        if (workDir.isDirectory) {
+          LocalFileSystem.getInstance().refreshAndFindFileByIoFile(workDir)?.let { vf ->
+            if (vf.isValid) vf.refresh(true, true)
+          }
+        }
+        workDir.parentFile?.takeIf { it.isDirectory }?.let { parent ->
+          LocalFileSystem.getInstance().refreshAndFindFileByIoFile(parent)?.let { vf ->
+            if (vf.isValid) vf.refresh(true, true)
+          }
+        }
+      }.onFailure { appendDebug("WARN vfs refresh: ${it.message}", PackLogTone.WARN) }
+    }
+
+    fun detectZip(params: MavenRunnerParameters) {
+      val goalsText = params.goals.joinToString(" ")
+      val kind = when {
+        goalsText.contains(":descriptorPack") -> OssUploader.PackKind.DESCRIPTOR
+        goalsText.contains(":oyezPack") -> OssUploader.PackKind.OYEZ
+        else -> null
+      } ?: return
+      val opt = params.cmdOptions.orEmpty()
+      val outputName = when (kind) {
+        OssUploader.PackKind.DESCRIPTOR ->
+          opt.substringAfter("-Ddescriptor.outputName=", "").substringBefore(' ').trim()
+        OssUploader.PackKind.OYEZ ->
+          opt.substringAfter("-Dimpl.outputName=", "").substringBefore(' ').trim()
+        OssUploader.PackKind.MARKETPLACE -> ""
+      }
+      val baseName = outputName.ifBlank { java.io.File(params.workingDirPath).name }
+      val zip = java.io.File(params.workingDirPath, "target/$baseName.zip")
+      if (zip.exists() && zip.isFile) {
+        onPackZipProduced?.invoke(kind, zip)
+      }
+    }
+
+    // Run one Maven step synchronously (blocks until process exits). Returns exit code.
+    fun runOneStep(params: MavenRunnerParameters, stepNo: Int, tag: String): Int {
+      val stepLine = runCatching { formatMavenStep(stepNo, totalSteps, params) }
+        .getOrDefault("[$stepNo/$totalSteps] goals=${params.goals.joinToString(" ")}")
+      ApplicationManager.getApplication().invokeLater {
+        statusArea.text = if (tag == "预置") stepLine else "[$tag] $stepLine"
+      }
+      appendDebug(if (tag == "预置") "START $stepLine" else "[$tag] START $stepLine", PackLogTone.DEFAULT)
+
+      val commandLine = buildMvnCommand(params)
+      appendDebug(if (tag == "预置") "CMD  ${commandLine.commandLineString}"
+      else "[$tag] CMD  ${commandLine.commandLineString}", PackLogTone.DEFAULT)
+
+      val latch = java.util.concurrent.CountDownLatch(1)
+      val exitCodeRef = AtomicInteger(-1)
+
+      val handler = try {
+        OSProcessHandler(commandLine)
+      } catch (e: Throwable) {
+        appendDebug("ERROR starting mvn: ${e.javaClass.name}: ${e.message}", PackLogTone.ERROR)
+        return -1
+      }
+      packCoordinator?.attachMavenHandler(handler)
+
+      handler.addProcessListener(object : ProcessAdapter() {
+        override fun onTextAvailable(event: ProcessEvent, outputType: Key<*>) {
+          val text = event.text.trimEnd()
+          if (text.isBlank()) return
+          val prefix = when (outputType) {
+            ProcessOutputTypes.STDERR -> "ERR"
+            ProcessOutputTypes.SYSTEM -> "SYS"
+            else -> "OUT"
+          }
+          appendDebug(if (tag == "预置") "$prefix $text" else "[$tag] $prefix $text", PackLogTone.DEFAULT)
+        }
+
+        override fun processTerminated(event: ProcessEvent) {
+          exitCodeRef.set(event.exitCode)
+          appendDebug(if (tag == "预置") "EXIT ${event.exitCode} $stepLine"
+          else "[$tag] EXIT ${event.exitCode} $stepLine", PackLogTone.DEFAULT)
+          packCoordinator?.detachMavenHandler(handler)
+          refreshModuleVfs(params.workingDirPath)
+          detectZip(params)
+          latch.countDown()
+        }
+      })
+      handler.startNotify()
+      try {
+        latch.await()
+      } catch (_: InterruptedException) {
+        if (!handler.isProcessTerminated) handler.destroyProcess()
+      }
+      return exitCodeRef.get()
+    }
+
+    // ---- 1. Preflight (serial) ----
+    val stepCounter = AtomicInteger(0)
+    for (params in preflightCommands) {
+      val stepNo = stepCounter.incrementAndGet()
+      val exitCode = runOneStep(params, stepNo, "预置")
+      if (exitCode != 0) {
+        packCoordinator?.consumeStopRequested()
+        onStepFailed?.invoke(params, exitCode)
+        releasePackLock()
+        return
+      }
+    }
+
+    // ---- 2. Per-module parallel ----
+    val parallelConcurrency = minOf(chainCount, 3)
+    appendDebug("PACK 并行阶段：$chainCount 个 module，并发数 $parallelConcurrency", PackLogTone.PROGRESS)
+
+    val semaphore = java.util.concurrent.Semaphore(parallelConcurrency)
+    val stopFlag = AtomicBoolean(false)
+    val successCount = AtomicInteger(0)
+    val failCount = AtomicInteger(0)
+    val executor = java.util.concurrent.Executors.newFixedThreadPool(parallelConcurrency)
+
+    for ((tag, chain) in pomDirChains) {
+      executor.submit {
+        try {
+          semaphore.acquire()
+          appendDebug("[并行:$tag] 取得执行槽位（${chain.size} 步）", PackLogTone.PROGRESS)
+          var pomDirOk = true
+          for (params in chain) {
+            if (stopFlag.get() || packCoordinator?.consumeStopRequested() == true) {
+              appendDebug("[并行:$tag] 收到停止信号，跳过剩余步骤", PackLogTone.WARN)
+              pomDirOk = false
+              break
+            }
+            val stepNo = stepCounter.incrementAndGet()
+            val exitCode = runOneStep(params, stepNo, tag)
+            if (exitCode != 0) {
+              appendDebug("[并行:$tag] 失败，停止本 module 后续步骤", PackLogTone.ERROR)
+              onStepFailed?.invoke(params, exitCode)
+              pomDirOk = false
+              break
+            }
+          }
+          if (pomDirOk) successCount.incrementAndGet() else failCount.incrementAndGet()
+        } catch (_: InterruptedException) {
+          // ignore
+        } finally {
+          semaphore.release()
+        }
+      }
+    }
+
+    executor.shutdown()
+    try { executor.awaitTermination(30, java.util.concurrent.TimeUnit.MINUTES) }
+    catch (_: InterruptedException) { executor.shutdownNow() }
+
+    val userStopped = packCoordinator?.consumeStopRequested() == true
+    ApplicationManager.getApplication().invokeLater {
+      if (userStopped) {
+        statusArea.text = "打包已停止（用户中断）"
+      } else if (failCount.get() > 0) {
+        statusArea.text = "打包部分失败：${successCount.get()}/${chainCount} 个 module 成功"
+      } else {
+        statusArea.text = "打包完成：$title（${chainCount} 个 module，共 $totalSteps 步）"
+      }
+    }
+    appendDebug(
+      "== 并行结果：成功 ${successCount.get()} / 失败 ${failCount.get()} / 共 $chainCount 个 module ==",
+      if (failCount.get() > 0) PackLogTone.ERROR else PackLogTone.OK
+    )
+    if (failCount.get() == 0 && !userStopped) onAllSucceeded?.invoke()
+    releasePackLock()
   }
 
   /** 商城展示名 / 默认 zip 基名：`算子名`（实现态打包时会再加 `-oyez-{yyyyMMddHHmmss}`，与定义态 `-descriptor-` 对称）。 */
@@ -2136,13 +2404,17 @@ class DatayooPickerToolWindowFactory : ToolWindowFactory, DumbAware {
     }
 
     fun onPackStarted() {
-      runConsoleStopPackBtn.isEnabled = true
-      runConsoleStopPackBtn.text = "停止打包"
+      ApplicationManager.getApplication().invokeLater {
+        runConsoleStopPackBtn.isEnabled = true
+        runConsoleStopPackBtn.text = "停止打包"
+      }
     }
 
     fun onPackEnded() {
-      runConsoleStopPackBtn.isEnabled = false
-      runConsoleStopPackBtn.text = "已停止"
+      ApplicationManager.getApplication().invokeLater {
+        runConsoleStopPackBtn.isEnabled = false
+        runConsoleStopPackBtn.text = "已停止"
+      }
     }
 
     runConsoleStopPackBtn.addActionListener { performStopPackAction() }
@@ -2491,13 +2763,15 @@ class DatayooPickerToolWindowFactory : ToolWindowFactory, DumbAware {
     val resultTable = object : JBTable(tableModel) {
       override fun prepareRenderer(renderer: TableCellRenderer, row: Int, column: Int): java.awt.Component {
         val c = super.prepareRenderer(renderer, row, column)
-        if (!isRowSelected(row)) {
-          val mr = convertRowIndexToModel(row)
-          val op = currentRows.getOrNull(mr)
-          val key = op?.let { "${it.className}|${it.name}" }
-          if (key != null && packFailHintByOpKey.containsKey(key)) {
-            c.background = JBColor(0xFFCDD2, 0x4C2828)
-          }
+        val mr = convertRowIndexToModel(row)
+        val op = currentRows.getOrNull(mr)
+        val key = op?.let { "${it.className}|${it.name}" }
+        val failed = key != null && packFailHintByOpKey.containsKey(key)
+        if (failed && !isRowSelected(row)) {
+          c.background = JBColor(0xEF9A9A, 0x6B2020)
+        } else if (!isRowSelected(row) && !failed) {
+          // Explicitly reset to avoid color bleeding between rows on hover
+          c.background = UIManager.getColor("Table.background") ?: UIUtil.getPanelBackground()
         }
         return c
       }
@@ -3017,21 +3291,30 @@ class DatayooPickerToolWindowFactory : ToolWindowFactory, DumbAware {
         LocalFileSystem.getInstance().refreshAndFindFileByPath(path.replace('\\', '/'))
           ?.takeIf { it.isValid && it.isDirectory }
       } ?: findDescriptorRootForOperator(project, row)?.let { findNearestPomDir(it) }
-      // 定义态包命名：{算子名}-descriptor-{version}.zip（version 多为 yyyyMMddHHmmss，中间段用 .+ 吸纳）
+      // 1) per-operator: {baseName}-descriptor-{version}.zip
       val descriptorPattern = Regex("^${Regex.escape(baseName)}-descriptor-.+\\.zip$", RegexOption.IGNORE_CASE)
+      // 2) fallback: any module-level *-descriptor-*.zip (latest)
+      val moduleDescPattern = Regex(".+-descriptor-.+\\.zip$", RegexOption.IGNORE_CASE)
       val descriptorZip = descriptorPomDir?.let {
         val targetDir = java.io.File(it.path, "target")
-        targetDir.listFiles()
+        val match = targetDir.listFiles()
           ?.asSequence()
           ?.filter { f -> f.isFile && f.length() > 0L && descriptorPattern.matches(f.name) }
           ?.sortedByDescending { f -> f.lastModified() }
           ?.firstOrNull()
+        match
+          ?: targetDir.listFiles()
+            ?.asSequence()
+            ?.filter { f -> f.isFile && f.length() > 0L && moduleDescPattern.matches(f.name) }
+            ?.sortedByDescending { f -> f.lastModified() }
+            ?.firstOrNull()
       }
         ?: descriptorPomDir?.let { java.io.File(it.path, "target/$baseName.zip") }?.takeIf { it.exists() && it.isFile && it.length() > 0L }
 
       val implPomDir = resolveImplModulePomDir(project, row)
-      // 实现态包命名：{算子名}-oyez-{version}.zip（与 impl.outputName 对齐）；兼容旧产物 {算子名}.zip
       val oyezPattern = Regex("^${Regex.escape(baseName)}-oyez-.+\\.zip$", RegexOption.IGNORE_CASE)
+      // fallback: any module-level *-oyez-*.zip (latest)
+      val moduleOyezPattern = Regex(".+-oyez-.+\\.zip$", RegexOption.IGNORE_CASE)
       val oyezZip = implPomDir?.let { dir ->
         val targetDir = java.io.File(dir.path, "target")
         val versioned = targetDir.listFiles()
@@ -3040,6 +3323,11 @@ class DatayooPickerToolWindowFactory : ToolWindowFactory, DumbAware {
           ?.sortedByDescending { f -> f.lastModified() }
           ?.firstOrNull()
         versioned
+          ?: targetDir.listFiles()
+            ?.asSequence()
+            ?.filter { f -> f.isFile && f.length() > 0L && moduleOyezPattern.matches(f.name) }
+            ?.sortedByDescending { f -> f.lastModified() }
+            ?.firstOrNull()
           ?: java.io.File(dir.path, "target/$baseName.zip").takeIf { it.exists() && it.isFile && it.length() > 0L }
       }
 
@@ -4106,6 +4394,28 @@ class DatayooPickerToolWindowFactory : ToolWindowFactory, DumbAware {
       return Pair(onOk, onFail)
     }
 
+    /** 并行打包专用的错误回调：不弹窗、不提示"流程已停止"，仅标红算子并记录日志。 */
+    fun packMavenCallbacksParallel(fallbackRows: List<OperatorRow>): Pair<(() -> Unit)?, ((MavenRunnerParameters, Int) -> Unit)?> {
+      val onOk: () -> Unit = {
+        packFailHintByOpKey.clear()
+        ApplicationManager.getApplication().invokeLater { resultTable.repaint() }
+      }
+      val onFail: (MavenRunnerParameters, Int) -> Unit = { params, code ->
+        val hint = "打包失败 exit=$code（见打包调试）"
+        val failedKeys = resolvePackFailKeys(params, fallbackRows)
+        for (k in failedKeys) {
+          packFailHintByOpKey[k] = hint
+        }
+        applyPackSelectionByKeys(failedKeys, checked = true)
+        val pomPath = params.workingDirPath.substringAfterLast('/').substringAfterLast('\\')
+        ApplicationManager.getApplication().invokeLater {
+          resultTable.repaint()
+          setInlineStatus("$pomPath 打包失败（列表中标红），其余 module 继续。", PackLogTone.ERROR)
+        }
+      }
+      return Pair(onOk, onFail)
+    }
+
     fun runMavenPack(
       groups: Map<VirtualFile, List<OperatorRow>>,
       fullGoal: String,
@@ -4423,9 +4733,33 @@ class DatayooPickerToolWindowFactory : ToolWindowFactory, DumbAware {
         }
       }
 
+      // Module-level output name helper (reads artifactId from pom.xml)
+      fun moduleArtifactId(pomDir: VirtualFile): String {
+        val pomFile = java.io.File(pomDir.path, "pom.xml")
+        if (!pomFile.exists()) return pomDir.name
+        val text = pomFile.readText(Charsets.UTF_8)
+        val parentRemoved = text.replace(Regex("<parent>[\\s\\S]*?</parent>"), "")
+        return Regex("<artifactId>\\s*([^<\\s]+)\\s*</artifactId>")
+          .find(parentRemoved)?.groupValues?.getOrNull(1)
+          ?.trim() ?: pomDir.name
+      }
+      val modulePackTs = DateTimeFormatter.ofPattern("yyyyMMddHHmmss")
+        .format(java.time.LocalDateTime.now())
+      val moduleOutputNames = mutableMapOf<String, Pair<String,String>>() // pomDirPath -> (descBase, oyezBase)
+
       if (doDescriptor) {
         when (mode) {
-          "按Module打包" -> descriptorGroups.keys.forEach { appendWholeModule(descriptorPlan, it, DESCRIPTOR_PACK_GOAL) }
+          "按Module打包" -> descriptorGroups.keys.forEach { pomDir ->
+            val aid = moduleArtifactId(pomDir)
+            val descBase = "$aid-descriptor-$modulePackTs"
+            moduleOutputNames.getOrPut(pomDir.path) { Pair(descBase, "") }.let { moduleOutputNames[pomDir.path] = Pair(descBase, it.second) }
+            addPackageIfMissing(descriptorPlan, pomDir)
+            descriptorPlan.getOrPut(pomDir) { mutableListOf() } += createMavenParams(
+              pomDir = pomDir,
+              goals = listOf(DESCRIPTOR_PACK_GOAL),
+              cmdOptions = buildMavenCmdOptions(existing = "-Ddescriptor.outputName=$descBase", extra = emptyList())
+            )
+          }
           "所选算子合包" -> appendMergedPack(descriptorPlan, descriptorGroups, DESCRIPTOR_PACK_GOAL, "descriptor.includes", useImplIncludes = false)
           else -> appendPerOperatorPack(
             descriptorPlan,
@@ -4440,7 +4774,18 @@ class DatayooPickerToolWindowFactory : ToolWindowFactory, DumbAware {
 
       if (doOyez) {
         when (mode) {
-          "按Module打包" -> implGroups.keys.forEach { appendWholeModule(oyezPlan, it, OYEZ_PACK_GOAL) }
+          "按Module打包" -> implGroups.keys.forEach { pomDir ->
+            val aid = moduleArtifactId(pomDir)
+            val oyezBase = "$aid-oyez-$modulePackTs"
+            val prev = moduleOutputNames.getOrPut(pomDir.path) { Pair("", oyezBase) }
+            moduleOutputNames[pomDir.path] = Pair(prev.first, oyezBase)
+            addPackageIfMissing(oyezPlan, pomDir)
+            oyezPlan.getOrPut(pomDir) { mutableListOf() } += createMavenParams(
+              pomDir = pomDir,
+              goals = listOf(OYEZ_PACK_GOAL),
+              cmdOptions = buildMavenCmdOptions(existing = "-Dimpl.outputName=$oyezBase", extra = emptyList())
+            )
+          }
           "所选算子合包" -> appendMergedPack(oyezPlan, implGroups, OYEZ_PACK_GOAL, "impl.includes", useImplIncludes = true)
           else -> appendPerOperatorPack(
             oyezPlan,
@@ -4462,7 +4807,6 @@ class DatayooPickerToolWindowFactory : ToolWindowFactory, DumbAware {
         )
       }
 
-      val descriptorCommands = descriptorPlan.values.flatten()
       val descriptorDeployCommands = if (doDescriptor && descriptorPlan.isNotEmpty() && deployCheckbox.isSelected) {
         descriptorPlan.keys.map { pomDir ->
           createMavenParams(
@@ -4474,53 +4818,144 @@ class DatayooPickerToolWindowFactory : ToolWindowFactory, DumbAware {
       } else {
         emptyList()
       }
-      val oyezCommands = oyezPlan.values.flatten()
-      val commands = preflightCommands + descriptorCommands + descriptorDeployCommands + oyezCommands
-      if (commands.isEmpty()) {
-        setInlineStatus("没有可执行的打包任务（includes 为空或未找到 pom.xml）。", PackLogTone.ERROR)
-        return
-      }
 
-      val deployPhase = if (descriptorDeployCommands.isNotEmpty()) " -> deploy" else ""
-      val preview = buildString {
-        appendLine("== 打包计划（祖先 module 预置 -> 定义态全量$deployPhase -> 实现态全量，严格串行）==")
-        appendLine(
-          "preflight steps=${preflightCommands.size}, descriptor steps=${descriptorCommands.size}, descriptor deploy=${descriptorDeployCommands.size}, oyez steps=${oyezCommands.size}"
-        )
-        commands.forEachIndexed { i, p -> appendLine(formatMavenStep(i + 1, commands.size, p)) }
-      }.trimEnd()
-      statusArea.text = preview
-      setPackLogContent(preview)
+      if (mode == "按Module打包") {
+        // ---- Parallel by pomDir ----
+        // Build per-pomDir chains: descriptor + deploy + oyez for each pomDir
+        val allPomDirs = linkedSetOf<VirtualFile>()
+        allPomDirs.addAll(descriptorPlan.keys)
+        allPomDirs.addAll(oyezPlan.keys)
+        val deployByPath = descriptorDeployCommands.associateBy { it.workingDirPath }
 
-      fun appendPackDebug(line: String, tone: PackLogTone = PackLogTone.DEFAULT) {
-        appendPackLogLine(line, tone)
-      }
-
-      val pc = packMavenCallbacks(selected)
-      appendPackDebug(
-        "PACK 阶段顺序：preflight（${preflightCommands.size} 步）-> descriptor（${descriptorCommands.size} 步）$deployPhase -> oyez（${oyezCommands.size} 步）"
-      )
-      onPackStarted()
-      runMavenSequential(
-        project,
-        statusArea,
-        commands,
-        "打包（preflight -> descriptor$deployPhase -> oyez）",
-        { line, tone -> appendPackDebug(line, tone) },
-        onPackZipProduced = { kind, file ->
-          appendPackDebug("ZIP ${kind.name} ${file.path}")
-        },
-        onAllSucceeded = pc.first,
-        onStepFailed = pc.second,
-        bindMavenStepHandler = { bindMavenStepToRunWindow(it) },
-        onPackSessionFinished = {
-          clearRunWindowPackProcessBinding()
-          onPackEnded()
+        val pomDirChains = allPomDirs.mapNotNull { pomDir ->
+          val path = pomDir.path
+          val chain = mutableListOf<MavenRunnerParameters>()
+          descriptorPlan[pomDir]?.let { chain.addAll(it) }
+          deployByPath[path]?.let { chain.add(it) }
+          oyezPlan[pomDir]?.let { chain.addAll(it) }
+          if (chain.isEmpty()) null
+          else Pair(pomDir.name, chain)
         }
-      )
+
+        val totalSteps = preflightCommands.size + pomDirChains.sumOf { it.second.size }
+        val preview = buildString {
+          appendLine("== 按Module打包计划（预置串行 -> ${pomDirChains.size} 个 module 并行，最多 3 并发）==")
+          appendLine("preflight steps=${preflightCommands.size}, modules=${pomDirChains.size}, total steps=$totalSteps")
+          preflightCommands.forEachIndexed { i, p -> appendLine(formatMavenStep(i + 1, totalSteps, p)) }
+          pomDirChains.forEach { (name, chain) ->
+            appendLine("  [$name] ${chain.size} 步：" + chain.joinToString(" -> ") { it.goals.last() })
+          }
+        }.trimEnd()
+        statusArea.text = preview
+        setPackLogContent(preview)
+
+        fun appendPackDebug(line: String, tone: PackLogTone = PackLogTone.DEFAULT) {
+          appendPackLogLine(line, tone)
+        }
+
+        val pc = packMavenCallbacksParallel(selected)
+        appendPackDebug("PACK 按Module并行：preflight 串行（${preflightCommands.size} 步）-> ${pomDirChains.size} 个 module 并行", PackLogTone.DEFAULT)
+        onPackStarted()
+        runMavenParallelByPomDir(
+          project = project,
+          statusArea = statusArea,
+          preflightCommands = preflightCommands,
+          pomDirChains = pomDirChains,
+          totalSteps = totalSteps,
+          title = "按Module打包（预置串行 + module并行）",
+          appendDebug = { line, tone -> appendPackDebug(line, tone) },
+          onPackZipProduced = { kind, file -> appendPackDebug("ZIP ${kind.name} ${file.path}", PackLogTone.DEFAULT) },
+          onAllSucceeded = {
+            pc.first?.invoke()
+            // Collect module-level zips to project target/
+            val projectTarget = java.io.File(project.basePath, "target")
+            if (!projectTarget.exists()) projectTarget.mkdirs()
+            var collected = 0
+            for ((pomDirPath, names) in moduleOutputNames) {
+              val pomTarget = java.io.File(pomDirPath, "target")
+              val (descName, oyezName) = names
+              listOf(descName, oyezName).filter { it.isNotBlank() }.forEach { base ->
+                val src = java.io.File(pomTarget, "$base.zip")
+                if (src.exists() && src.isFile) {
+                  src.copyTo(java.io.File(projectTarget, src.name), overwrite = true)
+                  collected++
+                }
+              }
+            }
+            if (collected > 0) {
+              appendPackDebug("收集完成：$collected 个 module zip → ${projectTarget.path}", PackLogTone.OK)
+              ApplicationManager.getApplication().invokeLater {
+                setInlineStatus("打包 & 收集完成：$collected 个 zip → ${projectTarget.path}", PackLogTone.OK)
+              }
+            }
+          },
+          onStepFailed = pc.second,
+          onPackSessionFinished = {
+            clearRunWindowPackProcessBinding()
+            onPackEnded()
+          }
+        )
+      } else {
+        // ---- Sequential (original path for 逐算子单包 / 所选算子合包) ----
+        val descriptorCommands = descriptorPlan.values.flatten()
+        val oyezCommands = oyezPlan.values.flatten()
+        val commands = preflightCommands + descriptorCommands + descriptorDeployCommands + oyezCommands
+        if (commands.isEmpty()) {
+          setInlineStatus("没有可执行的打包任务（includes 为空或未找到 pom.xml）。", PackLogTone.ERROR)
+          return
+        }
+
+        val deployPhase = if (descriptorDeployCommands.isNotEmpty()) " -> deploy" else ""
+        val preview = buildString {
+          appendLine("== 打包计划（祖先 module 预置 -> 定义态全量$deployPhase -> 实现态全量，严格串行）==")
+          appendLine(
+            "preflight steps=${preflightCommands.size}, descriptor steps=${descriptorCommands.size}, descriptor deploy=${descriptorDeployCommands.size}, oyez steps=${oyezCommands.size}"
+          )
+          commands.forEachIndexed { i, p -> appendLine(formatMavenStep(i + 1, commands.size, p)) }
+        }.trimEnd()
+        statusArea.text = preview
+        setPackLogContent(preview)
+
+        fun appendPackDebug(line: String, tone: PackLogTone = PackLogTone.DEFAULT) {
+          appendPackLogLine(line, tone)
+        }
+
+        val pc = packMavenCallbacks(selected)
+        appendPackDebug(
+          "PACK 阶段顺序：preflight（${preflightCommands.size} 步）-> descriptor（${descriptorCommands.size} 步）$deployPhase -> oyez（${oyezCommands.size} 步）"
+        )
+        onPackStarted()
+        runMavenSequential(
+          project,
+          statusArea,
+          commands,
+          "打包（preflight -> descriptor$deployPhase -> oyez）",
+          { line, tone -> appendPackDebug(line, tone) },
+          onPackZipProduced = { kind, file ->
+            appendPackDebug("ZIP ${kind.name} ${file.path}")
+          },
+          onAllSucceeded = pc.first,
+          onStepFailed = pc.second,
+          bindMavenStepHandler = { bindMavenStepToRunWindow(it) },
+          onPackSessionFinished = {
+            clearRunWindowPackProcessBinding()
+            onPackEnded()
+          }
+        )
+      }
     }
 
     /** 工具栏「打包」：仅 `selectedPackRows()` 勾选的子集；与全勾同一套 `runPackWithMode` 流程，无按条数分支。 */
+    fun startPackByModule() {
+      if (currentRows.isEmpty()) {
+        setInlineStatus("没有扫描到的算子，请先扫描。", PackLogTone.WARN)
+        return
+      }
+      ApplicationManager.getApplication().executeOnPooledThread {
+        runPackWithMode("按Module打包", currentRows)
+      }
+    }
+
     fun startPackPerOperator() {
       val selected = selectedPackRows()
       runPackWithMode("逐算子单包", selected)
@@ -4611,38 +5046,67 @@ class DatayooPickerToolWindowFactory : ToolWindowFactory, DumbAware {
         }
       }
 
-      val descSources = selected.mapNotNull { computeZipTargets(it).descriptorZip }.filter { it.exists() && it.isFile }
-      val oyezSources = selected.mapNotNull { computeZipTargets(it).oyezZip }.filter { it.exists() && it.isFile }
+      // 区分单算子 zip（解包合并）与 module 级 zip（直接复制）
+      val descPerOp = mutableListOf<java.io.File>()
+      val descModule = mutableListOf<java.io.File>()
+      for (row in selected) {
+        val zip = computeZipTargets(row).descriptorZip ?: continue
+        if (!zip.exists() || !zip.isFile) continue
+        val baseName = marketplacePackBaseName(row)
+        if (Regex("^${Regex.escape(baseName)}-descriptor-.+\\.zip$", RegexOption.IGNORE_CASE).matches(zip.name))
+          descPerOp += zip else descModule += zip
+      }
+      val oyezPerOp = mutableListOf<java.io.File>()
+      val oyezModule = mutableListOf<java.io.File>()
+      for (row in selected) {
+        val zip = computeZipTargets(row).oyezZip ?: continue
+        if (!zip.exists() || !zip.isFile) continue
+        val baseName = marketplacePackBaseName(row)
+        if (Regex("^${Regex.escape(baseName)}-oyez-.+\\.zip$", RegexOption.IGNORE_CASE).matches(zip.name))
+          oyezPerOp += zip else oyezModule += zip
+      }
 
-      if (descSources.isEmpty() && oyezSources.isEmpty()) {
+      val totalSources = descPerOp.size + descModule.size + oyezPerOp.size + oyezModule.size
+      if (totalSources == 0) {
         appendPackLogLine("合包中止: 所选算子尚未打包（未找到 descriptor/oyez zip），请先点击「打包」打包。", PackLogTone.WARN)
         setInlineStatus("合包中止：未找到打包产物，请先「打包」。", PackLogTone.WARN)
         return
       }
 
-      appendPackLogLine("合包开始: 选中${selected.size}个算子, descriptor源${descSources.size}个, oyez源${oyezSources.size}个", PackLogTone.PROGRESS)
+      appendPackLogLine("合包开始: 选中${selected.size}个算子, 单算子descriptor${descPerOp.size}个, module descriptor${descModule.size}个, 单算子oyez${oyezPerOp.size}个, module oyez${oyezModule.size}个", PackLogTone.PROGRESS)
 
+      // 单算子 zip → 解包合并
       var descCount = 0
-      if (descSources.isNotEmpty()) {
-        descCount = buildMergedZip(descSources, java.io.File(targetDir, "selected-descriptor-$ts.zip"), "descriptor")
+      if (descPerOp.isNotEmpty()) {
+        descCount = buildMergedZip(descPerOp, java.io.File(targetDir, "selected-descriptor-$ts.zip"), "descriptor")
         if (descCount > 0) appendPackLogLine("合包完成(定义态) selected-descriptor-$ts.zip: ${descCount} 文件", PackLogTone.OK)
         else appendPackLogLine("合包未生成(定义态): 无可用条目", PackLogTone.ERROR)
       }
-
       var oyezCount = 0
-      if (oyezSources.isNotEmpty()) {
-        oyezCount = buildMergedZip(oyezSources, java.io.File(targetDir, "selected-oyez-$ts.zip"), "oyez")
+      if (oyezPerOp.isNotEmpty()) {
+        oyezCount = buildMergedZip(oyezPerOp, java.io.File(targetDir, "selected-oyez-$ts.zip"), "oyez")
         if (oyezCount > 0) appendPackLogLine("合包完成(实现态) selected-oyez-$ts.zip: ${oyezCount} 文件", PackLogTone.OK)
         else appendPackLogLine("合包未生成(实现态): 无可用条目", PackLogTone.ERROR)
       }
 
-      if (descCount == 0 && oyezCount == 0) {
+      // module 级 zip → 直接复制到 target/
+      for (zip in (descModule + oyezModule)) {
+        val dest = java.io.File(targetDir, zip.name)
+        zip.copyTo(dest, overwrite = true)
+        appendPackLogLine("合包(module): 复制 ${zip.name} → ${dest.path}", PackLogTone.OK)
+      }
+
+      val totalMerged = descCount + oyezCount + descModule.size + oyezModule.size
+      if (totalMerged == 0) {
+        appendPackLogLine("合包总结: 未生成任何输出", PackLogTone.WARN)
         setInlineStatus("合包未生成任何输出 — 所选算子可能尚未打包。", PackLogTone.WARN)
       } else {
         val parts = mutableListOf<String>()
-        if (descCount > 0) parts += "定义态"
-        if (oyezCount > 0) parts += "实现态"
-        setInlineStatus("合包完成: ${parts.joinToString("+")} → ${targetDir.path}", PackLogTone.OK)
+        if (descCount > 0) parts += "定义态(合并${descCount}文件)"
+        if (oyezCount > 0) parts += "实现态(合并${oyezCount}文件)"
+        if (descModule.size + oyezModule.size > 0) parts += "module复制${descModule.size + oyezModule.size}个"
+        appendPackLogLine("合包总结: ${parts.joinToString("，")} → ${targetDir.path}", PackLogTone.OK)
+        setInlineStatus("合包完成 → ${targetDir.path}", PackLogTone.OK)
       }
     }
 
@@ -4699,6 +5163,10 @@ class DatayooPickerToolWindowFactory : ToolWindowFactory, DumbAware {
       toolTipText = "对已勾选算子批量准备上传实现态 zip"
       addActionListener { prepareBatchMallUpload(OssUploader.PackKind.OYEZ) }
     }
+    val packByModuleBtn = JButton("按Module").apply {
+      toolTipText = "按 Module 整体打包：每个 module 执行 clean → package → descriptorPack → deploy(如开启) → oyezPack，不使用 includes 过滤"
+      addActionListener { startPackByModule() }
+    }
     val packPerOperatorBtn = JButton("打包").apply {
       toolTipText = "对勾选行列表打包（每行 descriptor+oyez）；勾一行与勾多行同一套逻辑，仅列表子集不同"
       addActionListener { startPackPerOperator() }
@@ -4735,6 +5203,7 @@ class DatayooPickerToolWindowFactory : ToolWindowFactory, DumbAware {
     actionsGrid.add(sep())
     // 批量打包
     actionsGrid.add(label("打包"))
+    actionsGrid.add(packByModuleBtn)
     actionsGrid.add(packPerOperatorBtn)
     actionsGrid.add(packMergedBtn)
     actionsGrid.add(sep())
